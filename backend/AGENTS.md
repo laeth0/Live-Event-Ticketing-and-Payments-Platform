@@ -266,5 +266,3 @@ services.Scan(scan => scan
   validation, authorization, status codes, `ProblemDetails`, and cancellation behavior.
 - When EF Core behavior changes, inspect generated SQL where relevant and confirm that
   the migration, model snapshot, and database update contain only the intended changes.
-- Before completion, inspect the final diff and confirm every ASP.NET Core-specific rule
-  remains consistent with the root `AGENTS.md`.
