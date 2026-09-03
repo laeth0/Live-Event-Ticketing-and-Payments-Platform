@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Concourse.Api/Concourse.Api.csproj" />
+    <Project Path="src/Concourse.Application/Concourse.Application.csproj" />
+    <Project Path="src/Concourse.Domain/Concourse.Domain.csproj" />
+    <Project Path="src/Concourse.Infrastructure/Concourse.Infrastructure.csproj" />
+    <Project Path="src/Concourse.Persistence/Concourse.Persistence.csproj" />
+  </Folder>
+</Solution>
