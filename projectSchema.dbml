@@ -10,6 +10,8 @@
 //   - EXCLUDE USING gist (seat_hold_no_overlap)
 //   - range types (tstzrange), constraint triggers, rules
 //   - GENERATED ALWAYS AS IDENTITY (shown as bigint with a note)
+//   - ON DELETE CASCADE on inline refs (DBML disallows settings on inline
+//     refs, so it is recorded in the column note instead)
 
 Project concourse {
   database_type: 'PostgreSQL'
@@ -62,7 +64,7 @@ Table catalog.venue {
 
 Table catalog.seat {
   id          uuid [pk]
-  venue_id    uuid [not null]
+  venue_id    uuid [not null, ref: > catalog.venue.id, note: 'ON DELETE CASCADE']
   section     text [not null]
   row_label   text [not null]
   seat_number text [not null]
@@ -75,8 +77,8 @@ Table catalog.seat {
 
 Table catalog.event {
   id                       uuid        [pk]
-  organizer_id             uuid        [not null]
-  venue_id                 uuid        [not null]
+  organizer_id             uuid        [not null, ref: > catalog.organizer.id]
+  venue_id                 uuid        [not null, ref: > catalog.venue.id]
   name                     text        [not null]
   currency                 "char(3)"   [not null]
   doors_open_at            timestamptz [not null]
@@ -96,7 +98,7 @@ Table catalog.event {
 
 Table catalog.ticket_type {
   id           uuid      [pk]
-  event_id     uuid      [not null]
+  event_id     uuid      [not null, ref: > catalog.event.id, note: 'ON DELETE CASCADE']
   name         text      [not null]
   kind         text      [not null, note: "CHECK IN ('general_admission','reserved')"]
   price_minor  bigint    [not null, note: 'CHECK >= 0; server-side price']
@@ -111,9 +113,9 @@ Table catalog.ticket_type {
 }
 
 Table catalog.event_seat {
-  event_id       uuid [not null]
-  seat_id        uuid [not null]
-  ticket_type_id uuid [not null]
+  event_id       uuid [not null, ref: > catalog.event.id, note: 'ON DELETE CASCADE']
+  seat_id        uuid [not null, ref: > catalog.seat.id]
+  ticket_type_id uuid [not null, ref: > catalog.ticket_type.id]
   status         text [not null, default: 'available', note: "CHECK IN ('available','blocked')"]
 
   indexes {
@@ -124,7 +126,7 @@ Table catalog.event_seat {
 
 Table catalog.payment_route {
   id         uuid        [pk]
-  event_id   uuid        [not null]
+  event_id   uuid        [not null, ref: > catalog.event.id, note: 'ON DELETE CASCADE']
   provider   text        [not null, note: "CHECK IN ('wallet','psp_primary','psp_backup')"]
   is_enabled boolean     [not null, default: true]
   priority   int         [not null, default: 100]
@@ -142,7 +144,7 @@ Table catalog.payment_route {
 // ===========================================================================
 
 Table sales.ticket_type_inventory {
-  ticket_type_id uuid        [pk]
+  ticket_type_id uuid        [pk, ref: - catalog.ticket_type.id, note: 'ON DELETE CASCADE']
   allocated      int         [not null, note: 'CHECK >= 0']
   reserved       int         [not null, default: 0, note: 'CHECK >= 0']
   sold           int         [not null, default: 0, note: 'CHECK >= 0']
@@ -152,8 +154,8 @@ Table sales.ticket_type_inventory {
 
 Table sales.cart {
   id          uuid        [pk]
-  customer_id uuid        [not null]
-  event_id    uuid        [not null]
+  customer_id uuid        [not null, ref: > catalog.customer.id]
+  event_id    uuid        [not null, ref: > catalog.event.id]
   status      text        [not null, default: 'open', note: "CHECK IN ('open','checked_out','expired','abandoned')"]
   expires_at  timestamptz [not null]
   version     int         [not null, default: 0]
@@ -167,8 +169,8 @@ Table sales.cart {
 
 Table sales.hold {
   id             uuid        [pk]
-  cart_id        uuid        [not null]
-  ticket_type_id uuid        [not null]
+  cart_id        uuid        [not null, ref: > sales.cart.id, note: 'ON DELETE CASCADE']
+  ticket_type_id uuid        [not null, ref: > catalog.ticket_type.id]
   quantity       int         [not null, note: 'CHECK > 0']
   expires_at     timestamptz [not null]
   created_at     timestamptz [not null, default: `now()`]
@@ -186,7 +188,7 @@ Table sales.seat_hold {
   id           uuid        [pk]
   event_id     uuid        [not null]
   seat_id      uuid        [not null]
-  cart_id      uuid        [not null]
+  cart_id      uuid        [not null, ref: > sales.cart.id, note: 'ON DELETE CASCADE']
   during       tstzrange   [not null, note: 'CHECK NOT isempty(during) AND lower(during) IS NOT NULL']
   created_at   timestamptz [not null, default: `now()`]
   released_at  timestamptz
@@ -195,12 +197,12 @@ Table sales.seat_hold {
   indexes {
     (cart_id) [name: 'seat_hold_cart_idx']
   }
-  Note: 'INV-2 / INV-1. EXCLUDE USING gist (event_id WITH =, seat_id WITH =, during WITH &&) WHERE (released_at IS NULL) — rejects a competing insert at any isolation level. FK (event_id, seat_id) -> catalog.event_seat.'
+  Note: 'INV-2 / INV-1. Composite FK (event_id, seat_id) -> catalog.event_seat (see composite refs below). EXCLUDE USING gist (event_id WITH =, seat_id WITH =, during WITH &&) WHERE (released_at IS NULL) — rejects a competing insert at any isolation level.'
 }
 
 Table sales.customer_event_allocation {
-  customer_id    uuid        [not null]
-  event_id       uuid        [not null]
+  customer_id    uuid        [not null, ref: > catalog.customer.id]
+  event_id       uuid        [not null, ref: > catalog.event.id]
   held           int         [not null, default: 0, note: 'CHECK >= 0']
   owned          int         [not null, default: 0, note: 'CHECK >= 0']
   limit_snapshot int         [not null, note: 'CHECK > 0; copies event.max_tickets_per_customer at first touch']
@@ -214,7 +216,7 @@ Table sales.customer_event_allocation {
 
 Table sales.promo_code {
   id               uuid      [pk]
-  event_id         uuid      [not null]
+  event_id         uuid      [not null, ref: > catalog.event.id, note: 'ON DELETE CASCADE']
   code             text      [not null]
   discount_minor   bigint    [not null, note: 'CHECK > 0']
   budget_minor     bigint    [not null, note: 'CHECK >= 0']
@@ -230,9 +232,9 @@ Table sales.promo_code {
 
 Table sales.promo_redemption {
   id            uuid        [pk]
-  promo_code_id uuid        [not null]
-  customer_id   uuid        [not null]
-  cart_id       uuid        [not null]
+  promo_code_id uuid        [not null, ref: > sales.promo_code.id]
+  customer_id   uuid        [not null, ref: > catalog.customer.id]
+  cart_id       uuid        [not null, ref: > sales.cart.id, note: 'ON DELETE CASCADE']
   amount_minor  bigint      [not null, note: 'CHECK > 0']
   created_at    timestamptz [not null, default: `now()`]
 
@@ -244,9 +246,9 @@ Table sales.promo_redemption {
 
 Table sales.ticket_order {
   id              uuid        [pk]
-  cart_id         uuid        [not null]
-  customer_id     uuid        [not null]
-  event_id        uuid        [not null]
+  cart_id         uuid        [not null, ref: > sales.cart.id]
+  customer_id     uuid        [not null, ref: > catalog.customer.id]
+  event_id        uuid        [not null, ref: > catalog.event.id]
   status          text        [not null, default: 'pending_payment', note: "CHECK IN ('pending_payment','paid','cancelled','expired','partially_refunded','refunded')"]
   subtotal_minor  bigint      [not null, note: 'CHECK >= 0']
   discount_minor  bigint      [not null, default: 0, note: 'CHECK >= 0']
@@ -267,8 +269,8 @@ Table sales.ticket_order {
 
 Table sales.ticket_order_line {
   id               uuid   [pk]
-  order_id         uuid   [not null]
-  ticket_type_id   uuid   [not null]
+  order_id         uuid   [not null, ref: > sales.ticket_order.id, note: 'ON DELETE CASCADE']
+  ticket_type_id   uuid   [not null, ref: > catalog.ticket_type.id]
   seat_id          uuid   [note: 'CHECK (seat_id IS NULL OR quantity = 1)']
   quantity         int    [not null, note: 'CHECK > 0']
   unit_price_minor bigint [not null, note: 'CHECK >= 0']
@@ -280,12 +282,12 @@ Table sales.ticket_order_line {
 
 Table sales.ticket {
   id                 uuid        [pk]
-  order_line_id      uuid        [not null]
+  order_line_id      uuid        [not null, ref: > sales.ticket_order_line.id]
   seq                int         [not null, note: 'CHECK > 0']
-  event_id           uuid        [not null]
-  ticket_type_id     uuid        [not null]
+  event_id           uuid        [not null, ref: > catalog.event.id]
+  ticket_type_id     uuid        [not null, ref: > catalog.ticket_type.id]
   seat_id            uuid
-  holder_customer_id uuid        [not null]
+  holder_customer_id uuid        [not null, ref: > catalog.customer.id]
   barcode            text        [not null]
   status             text        [not null, default: 'issued', note: "CHECK IN ('issued','void','scanned')"]
   issued_at          timestamptz [not null, default: `now()`]
@@ -319,7 +321,7 @@ Table money.account_balance {
   balance_minor bigint      [not null, default: 0]
   version       bigint      [not null, default: 0]
   updated_at    timestamptz [not null, default: `now()`]
-  Note: 'Hot part of an otherwise immutable account. FK (account_id, account_kind) -> money.account (id, kind). CHECK (account_kind <> customer_wallet OR balance_minor >= 0) — INV-5.'
+  Note: 'Hot part of an otherwise immutable account. Composite FK (account_id, account_kind) -> money.account (id, kind) (see composite refs below). CHECK (account_kind <> customer_wallet OR balance_minor >= 0) — INV-5.'
 }
 
 Table money.journal {
@@ -337,8 +339,8 @@ Table money.journal {
 
 Table money.journal_entry {
   id           bigint      [pk, note: 'GENERATED ALWAYS AS IDENTITY']
-  journal_id   uuid        [not null]
-  account_id   uuid        [not null]
+  journal_id   uuid        [not null, ref: > money.journal.id]
+  account_id   uuid        [not null, ref: > money.account.id]
   amount_minor bigint      [not null, note: 'CHECK <> 0']
   currency     "char(3)"   [not null]
   created_at   timestamptz [not null, default: `now()`]
@@ -352,8 +354,8 @@ Table money.journal_entry {
 
 Table money.payment {
   id              uuid        [pk]
-  order_id        uuid        [not null]
-  customer_id     uuid        [not null]
+  order_id        uuid        [not null, ref: > sales.ticket_order.id]
+  customer_id     uuid        [not null, ref: > catalog.customer.id]
   method          text        [not null, note: "CHECK IN ('wallet','card')"]
   status          text        [not null, note: "CHECK IN ('initiated','authorizing','authorized','captured','failed','voided'); saga state machine"]
   amount_minor    bigint      [not null, note: 'CHECK > 0']
@@ -374,7 +376,7 @@ Table money.payment {
 
 Table money.payment_attempt {
   id           uuid        [pk]
-  payment_id   uuid        [not null]
+  payment_id   uuid        [not null, ref: > money.payment.id]
   attempt_no   int         [not null, note: 'CHECK > 0']
   outcome      text        [not null, note: "CHECK IN ('pending','success','declined','error','timeout')"]
   psp_response jsonb
@@ -387,8 +389,8 @@ Table money.payment_attempt {
 
 Table money.refund {
   id              uuid        [pk]
-  payment_id      uuid        [not null]
-  order_id        uuid        [not null]
+  payment_id      uuid        [not null, ref: > money.payment.id]
+  order_id        uuid        [not null, ref: > sales.ticket_order.id]
   amount_minor    bigint      [not null, note: 'CHECK > 0']
   reason          text        [not null]
   status          text        [not null, default: 'completed', note: "CHECK IN ('completed','failed')"]
@@ -402,7 +404,7 @@ Table money.refund {
 
 Table money.payout {
   id            uuid        [pk]
-  organizer_id  uuid        [not null]
+  organizer_id  uuid        [not null, ref: > catalog.organizer.id]
   business_date date        [not null]
   amount_minor  bigint      [not null, note: 'CHECK > 0']
   status        text        [not null, default: 'pending', note: "CHECK IN ('pending','sent','failed')"]
@@ -484,53 +486,13 @@ Table ops.idempotency_key {
 }
 
 // ===========================================================================
-// references
+// composite references
+// DBML has no inline syntax for multi-column foreign keys, so these two
+// stay in long form. All single-column FKs are inline on their columns above.
 // ===========================================================================
 
-// catalog
-Ref: catalog.seat.venue_id > catalog.venue.id [delete: cascade]
-Ref: catalog.event.organizer_id > catalog.organizer.id
-Ref: catalog.event.venue_id > catalog.venue.id
-Ref: catalog.ticket_type.event_id > catalog.event.id [delete: cascade]
-Ref: catalog.event_seat.event_id > catalog.event.id [delete: cascade]
-Ref: catalog.event_seat.seat_id > catalog.seat.id
-Ref: catalog.event_seat.ticket_type_id > catalog.ticket_type.id
-Ref: catalog.payment_route.event_id > catalog.event.id [delete: cascade]
-
-// sales
-Ref: sales.ticket_type_inventory.ticket_type_id > catalog.ticket_type.id [delete: cascade]
-Ref: sales.cart.customer_id > catalog.customer.id
-Ref: sales.cart.event_id > catalog.event.id
-Ref: sales.hold.cart_id > sales.cart.id [delete: cascade]
-Ref: sales.hold.ticket_type_id > catalog.ticket_type.id
-Ref: sales.seat_hold.cart_id > sales.cart.id [delete: cascade]
 Ref: sales.seat_hold.(event_id, seat_id) > catalog.event_seat.(event_id, seat_id)
-Ref: sales.customer_event_allocation.customer_id > catalog.customer.id
-Ref: sales.customer_event_allocation.event_id > catalog.event.id
-Ref: sales.promo_code.event_id > catalog.event.id [delete: cascade]
-Ref: sales.promo_redemption.promo_code_id > sales.promo_code.id
-Ref: sales.promo_redemption.customer_id > catalog.customer.id
-Ref: sales.promo_redemption.cart_id > sales.cart.id [delete: cascade]
-Ref: sales.ticket_order.cart_id > sales.cart.id
-Ref: sales.ticket_order.customer_id > catalog.customer.id
-Ref: sales.ticket_order.event_id > catalog.event.id
-Ref: sales.ticket_order_line.order_id > sales.ticket_order.id [delete: cascade]
-Ref: sales.ticket_order_line.ticket_type_id > catalog.ticket_type.id
-Ref: sales.ticket.order_line_id > sales.ticket_order_line.id
-Ref: sales.ticket.event_id > catalog.event.id
-Ref: sales.ticket.ticket_type_id > catalog.ticket_type.id
-Ref: sales.ticket.holder_customer_id > catalog.customer.id
-
-// money
-Ref: money.account_balance.(account_id, account_kind) > money.account.(id, kind)
-Ref: money.journal_entry.journal_id > money.journal.id
-Ref: money.journal_entry.account_id > money.account.id
-Ref: money.payment.order_id > sales.ticket_order.id
-Ref: money.payment.customer_id > catalog.customer.id
-Ref: money.payment_attempt.payment_id > money.payment.id
-Ref: money.refund.payment_id > money.payment.id
-Ref: money.refund.order_id > sales.ticket_order.id
-Ref: money.payout.organizer_id > catalog.organizer.id
+Ref: money.account_balance.(account_id, account_kind) - money.account.(id, kind)
 
 // ===========================================================================
 // table groups
