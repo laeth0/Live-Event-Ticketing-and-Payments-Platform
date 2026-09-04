@@ -12,6 +12,7 @@ builder.Services
 builder.Services.AddProblemDetails();
 builder.Services.AddControllers();
 builder.Services.AddAuthorization();
+builder.Services.AddHealthChecks();
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
@@ -35,5 +36,6 @@ if (app.Environment.IsDevelopment())
 }
 
 app.MapControllers();
+app.MapHealthChecks("/health");
 
 app.Run();

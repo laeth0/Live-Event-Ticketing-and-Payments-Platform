@@ -1,0 +1,14 @@
+.git
+.githooks
+.vs
+.vscode
+**/bin
+**/obj
+docs
+.env
+.env.*
+Dockerfile
+compose*.yaml
+compose*.yml
+docker-compose*.yaml
+docker-compose*.yml
