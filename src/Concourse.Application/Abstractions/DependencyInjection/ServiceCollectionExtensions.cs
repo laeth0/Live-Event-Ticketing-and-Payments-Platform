@@ -1,14 +1,16 @@
-using Concourse.Application.Abstractions.DependencyInjection;
+using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 
-namespace Concourse.Persistence;
+namespace Concourse.Application.Abstractions.DependencyInjection;
 
-public static class DependencyInjection
+public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddPersistence(this IServiceCollection services)
+    public static IServiceCollection AddServicesByLifetimeMarkers(
+        this IServiceCollection services,
+        Assembly assembly)
     {
         services.Scan(scan => scan
-            .FromAssemblies(AssemblyReference.Assembly)
+            .FromAssemblies(assembly)
             .AddClasses(classes => classes.AssignableTo<ITransientService>())
                 .AsImplementedInterfaces()
                 .WithTransientLifetime()

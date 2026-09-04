@@ -2,7 +2,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Concourse.Application\Concourse.Application.csproj" />
-    <ProjectReference Include="..\Concourse.Persistence\Concourse.Persistence.csproj" />
     <ProjectReference Include="..\Concourse.Infrastructure\Concourse.Infrastructure.csproj" />
   </ItemGroup>
 

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(git rev-parse --show-toplevel)
+solution_path="Concourse.slnx"
+
+cd "$repository_root"
+
+mapfile -d '' staged_files < <(
+    git diff --cached --name-only --diff-filter=ACMR -z -- ':(glob)src/**/*.cs'
+)
+
+if (( ${#staged_files[@]} == 0 )); then
+    exit 0
+fi
+
+temporary_directory=$(mktemp -d)
+completed=false
+prepared_files=()
+
+declare -A original_modes
+declare -A original_objects
+declare -A preserve_worktree
+
+cleanup() {
+    if [[ "$completed" != true ]]; then
+        for file_path in "${prepared_files[@]}"; do
+            git update-index --add --cacheinfo \
+                "${original_modes["$file_path"]},${original_objects["$file_path"]},$file_path"
+            cp -- \
+                "$temporary_directory/worktree/$file_path" \
+                "$repository_root/$file_path"
+        done
+    fi
+
+    rm -rf "$temporary_directory"
+}
+
+trap cleanup EXIT
+
+for file_path in "${staged_files[@]}"; do
+    index_entry=$(git ls-files --stage -- "$file_path")
+    index_entry_without_mode=${index_entry#* }
+
+    original_modes["$file_path"]=${index_entry%% *}
+    original_objects["$file_path"]=${index_entry_without_mode%% *}
+
+    mkdir -p "$temporary_directory/worktree/$(dirname "$file_path")"
+    cp -- \
+        "$repository_root/$file_path" \
+        "$temporary_directory/worktree/$file_path"
+
+    prepared_files+=("$file_path")
+
+    if git diff --quiet -- "$file_path"; then
+        preserve_worktree["$file_path"]=false
+    else
+        preserve_worktree["$file_path"]=true
+    fi
+
+    git checkout-index --force -- "$file_path"
+done
+
+dotnet restore "$solution_path" --force --nologo
+
+dotnet build "$solution_path" \
+    --no-restore \
+    --nologo \
+    --property:EnforceCodeStyleInBuild=false
+
+dotnet format "$solution_path" whitespace \
+    --no-restore \
+    --include "${staged_files[@]}" \
+    --verbosity minimal
+
+dotnet format "$solution_path" analyzers \
+    --no-restore \
+    --include "${staged_files[@]}" \
+    --diagnostics IDE0005 \
+    --verbosity minimal
+
+dotnet build "$solution_path" \
+    --no-restore \
+    --nologo
+
+for file_path in "${staged_files[@]}"; do
+    object_id=$(git hash-object -w -- "$repository_root/$file_path")
+
+    git update-index --add --cacheinfo \
+        "${original_modes["$file_path"]},$object_id,$file_path"
+
+    if [[ "${preserve_worktree["$file_path"]}" == true ]]; then
+        cp -- \
+            "$temporary_directory/worktree/$file_path" \
+            "$repository_root/$file_path"
+    fi
+done
+
+completed=true
+
+printf 'Formatted staged C# and removed unused using directives from %d file(s).\n' \
+    "${#staged_files[@]}"

@@ -13,7 +13,6 @@
     </PackageReference>
     <PackageReference Include="Npgsql" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
-    <PackageReference Include="Scrutor" />
   </ItemGroup>
 
   <PropertyGroup>

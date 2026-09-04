@@ -1,7 +1,6 @@
 # ASP.NET Core Engineering Standards
 
-These rules apply to ASP.NET Core work in this repository and extend the
-repository-root `AGENTS.md`; do not repeat its general engineering guidance here.
+These rules apply to ASP.NET Core work in this repository.
 
 ## Required ASP.NET Core Stack
 

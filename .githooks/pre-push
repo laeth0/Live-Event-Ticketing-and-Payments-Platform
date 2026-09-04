@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+remote_name=$1
+remote_url=$2
+zero_object_id="0000000000000000000000000000000000000000"
+fetch_target=$remote_name
+
+if ! git remote get-url "$remote_name" >/dev/null 2>&1; then
+    fetch_target=$remote_url
+fi
+
+while read -r local_ref local_object_id remote_ref remote_object_id; do
+    if [[ "$local_ref" != refs/heads/* || "$remote_ref" != refs/heads/* ]]; then
+        continue
+    fi
+
+    if [[ "$local_object_id" == "$zero_object_id" ||
+          "$remote_object_id" == "$zero_object_id" ]]; then
+        continue
+    fi
+
+    if ! git fetch --quiet --no-tags "$fetch_target" "$remote_ref"; then
+        printf 'Push rejected: unable to check the latest state of %s.\n' "$remote_ref" >&2
+        exit 1
+    fi
+
+    if ! git merge-base --is-ancestor "$remote_object_id" "$local_object_id"; then
+        branch_name=${remote_ref#refs/heads/}
+
+        printf 'Push rejected: the remote branch %s contains commits missing locally.\n' \
+            "$branch_name" >&2
+        printf 'Pull first with: git pull --rebase %s %s\n' \
+            "$remote_name" "$branch_name" >&2
+        exit 1
+    fi
+done
