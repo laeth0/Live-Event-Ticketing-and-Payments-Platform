@@ -1,0 +1,579 @@
+// Concourse — Live Event Ticketing & Payments Platform
+// PostgreSQL 16 schema, expressed in DBML (https://dbml.dbdiagram.io).
+//
+// Source of truth: docs/project-requirements/04-database-design.md
+// This file is a visual/reference model. DBML cannot express several
+// constructs the real DDL relies on; those are recorded in table/column
+// notes here and remain authoritative in the SQL:
+//   - CHECK constraints and enumerations (text + CHECK, not PG enum)
+//   - partial indexes (WHERE ...) and expression indexes
+//   - EXCLUDE USING gist (seat_hold_no_overlap)
+//   - range types (tstzrange), constraint triggers, rules
+//   - GENERATED ALWAYS AS IDENTITY (shown as bigint with a note)
+
+Project concourse {
+  database_type: 'PostgreSQL'
+  Note: '''
+    Four schemas, one per bounded context:
+      catalog - parties, venues, events, ticket types, payment routes
+      sales   - carts, holds, orders, tickets, inventory, promos
+      money   - accounts, double-entry ledger, payments, refunds, payouts
+      ops     - outbox, jobs, idempotency, dedup
+
+    Conventions:
+      - Business PKs: uuid (application-generated UUIDv7).
+      - High-volume append-only PKs: bigint GENERATED ALWAYS AS IDENTITY.
+      - Money: bigint minor units + char(3) currency. Never float.
+      - Time: timestamptz (UTC). Validity windows: tstzrange.
+      - Enumerations: text + CHECK (col IN (...)).
+  '''
+}
+
+// ===========================================================================
+// schema: catalog
+// ===========================================================================
+
+Table catalog.organizer {
+  id            uuid        [pk]
+  name          text        [not null, note: 'CHECK length(btrim(name)) > 0']
+  status        text        [not null, default: 'active', note: "CHECK IN ('active','suspended','closed')"]
+  currency      "char(3)"   [not null]
+  reserve_minor bigint      [not null, default: 0, note: 'CHECK >= 0; rolling reserve subtracted from payouts (INV-11)']
+  created_at    timestamptz [not null, default: `now()`]
+}
+
+Table catalog.customer {
+  id         uuid        [pk]
+  email      text        [not null, note: "CHECK position('@' IN email) > 1"]
+  status     text        [not null, default: 'active', note: "CHECK IN ('active','blocked')"]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (`lower(email)`) [unique, name: 'customer_email_uk', note: 'case-insensitive one-account-per-email']
+  }
+}
+
+Table catalog.venue {
+  id         uuid        [pk]
+  name       text        [not null]
+  timezone   text        [not null, note: 'IANA name (data, not server config)']
+  created_at timestamptz [not null, default: `now()`]
+}
+
+Table catalog.seat {
+  id          uuid [pk]
+  venue_id    uuid [not null]
+  section     text [not null]
+  row_label   text [not null]
+  seat_number text [not null]
+
+  indexes {
+    (venue_id, section, row_label, seat_number) [unique, name: 'seat_unique_in_venue']
+    (venue_id, section) [name: 'seat_venue_section_idx']
+  }
+}
+
+Table catalog.event {
+  id                       uuid        [pk]
+  organizer_id             uuid        [not null]
+  venue_id                 uuid        [not null]
+  name                     text        [not null]
+  currency                 "char(3)"   [not null]
+  doors_open_at            timestamptz [not null]
+  starts_at                timestamptz [not null, note: 'CHECK starts_at > doors_open_at']
+  status                   text        [not null, default: 'draft', note: "CHECK IN ('draft','onsale','paused','closed','cancelled')"]
+  max_tickets_per_customer int         [not null, default: 6, note: 'CHECK BETWEEN 1 AND 50']
+  enabled_route_count      int         [not null, default: 0, note: 'materialised count; CHECK (status <> onsale OR enabled_route_count >= 1) — INV-9']
+  version                  int         [not null, default: 0, note: 'optimistic concurrency for organizer edits']
+  published_at             timestamptz
+  created_at               timestamptz [not null, default: `now()`]
+  updated_at               timestamptz [not null, default: `now()`]
+
+  indexes {
+    (starts_at) [name: 'event_onsale_idx', note: "partial: WHERE status = 'onsale'"]
+  }
+}
+
+Table catalog.ticket_type {
+  id           uuid      [pk]
+  event_id     uuid      [not null]
+  name         text      [not null]
+  kind         text      [not null, note: "CHECK IN ('general_admission','reserved')"]
+  price_minor  bigint    [not null, note: 'CHECK >= 0; server-side price']
+  currency     "char(3)" [not null]
+  sales_window tstzrange [not null]
+  version      int       [not null, default: 0]
+
+  indexes {
+    (event_id, name) [unique, name: 'ticket_type_name_uk']
+    (event_id) [name: 'ticket_type_event_idx']
+  }
+}
+
+Table catalog.event_seat {
+  event_id       uuid [not null]
+  seat_id        uuid [not null]
+  ticket_type_id uuid [not null]
+  status         text [not null, default: 'available', note: "CHECK IN ('available','blocked')"]
+
+  indexes {
+    (event_id, seat_id) [pk]
+    (event_id, ticket_type_id) [name: 'event_seat_type_idx']
+  }
+}
+
+Table catalog.payment_route {
+  id         uuid        [pk]
+  event_id   uuid        [not null]
+  provider   text        [not null, note: "CHECK IN ('wallet','psp_primary','psp_backup')"]
+  is_enabled boolean     [not null, default: true]
+  priority   int         [not null, default: 100]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (event_id, provider) [unique, name: 'payment_route_uk']
+    (event_id) [name: 'payment_route_enabled_idx', note: 'partial: WHERE is_enabled']
+  }
+  Note: 'INV-9 (>=1 enabled route per onsale event) is enforced via event.enabled_route_count + CHECK, a guard-row lock, or SERIALIZABLE — not expressible as a CHECK here.'
+}
+
+// ===========================================================================
+// schema: sales
+// ===========================================================================
+
+Table sales.ticket_type_inventory {
+  ticket_type_id uuid        [pk]
+  allocated      int         [not null, note: 'CHECK >= 0']
+  reserved       int         [not null, default: 0, note: 'CHECK >= 0']
+  sold           int         [not null, default: 0, note: 'CHECK >= 0']
+  updated_at     timestamptz [not null, default: `now()`]
+  Note: 'The hot counter row. CHECK (reserved + sold <= allocated) — INV-3. No non-PK indexes by design (HOT updates).'
+}
+
+Table sales.cart {
+  id          uuid        [pk]
+  customer_id uuid        [not null]
+  event_id    uuid        [not null]
+  status      text        [not null, default: 'open', note: "CHECK IN ('open','checked_out','expired','abandoned')"]
+  expires_at  timestamptz [not null]
+  version     int         [not null, default: 0]
+  created_at  timestamptz [not null, default: `now()`]
+
+  indexes {
+    (customer_id, event_id) [unique, name: 'cart_one_open_per_customer_event_uk', note: "partial: WHERE status = 'open'"]
+    (expires_at) [name: 'cart_expiry_idx', note: "partial: WHERE status = 'open'"]
+  }
+}
+
+Table sales.hold {
+  id             uuid        [pk]
+  cart_id        uuid        [not null]
+  ticket_type_id uuid        [not null]
+  quantity       int         [not null, note: 'CHECK > 0']
+  expires_at     timestamptz [not null]
+  created_at     timestamptz [not null, default: `now()`]
+  released_at    timestamptz
+  converted_at   timestamptz
+
+  indexes {
+    (expires_at, id) [name: 'hold_reapable_idx', note: 'partial: WHERE released_at IS NULL AND converted_at IS NULL']
+    (cart_id) [name: 'hold_cart_idx']
+  }
+  Note: 'CHECK (released_at IS NULL OR converted_at IS NULL). General-admission reservation; pairs with the inventory counter.'
+}
+
+Table sales.seat_hold {
+  id           uuid        [pk]
+  event_id     uuid        [not null]
+  seat_id      uuid        [not null]
+  cart_id      uuid        [not null]
+  during       tstzrange   [not null, note: 'CHECK NOT isempty(during) AND lower(during) IS NOT NULL']
+  created_at   timestamptz [not null, default: `now()`]
+  released_at  timestamptz
+  converted_at timestamptz
+
+  indexes {
+    (cart_id) [name: 'seat_hold_cart_idx']
+  }
+  Note: 'INV-2 / INV-1. EXCLUDE USING gist (event_id WITH =, seat_id WITH =, during WITH &&) WHERE (released_at IS NULL) — rejects a competing insert at any isolation level. FK (event_id, seat_id) -> catalog.event_seat.'
+}
+
+Table sales.customer_event_allocation {
+  customer_id    uuid        [not null]
+  event_id       uuid        [not null]
+  held           int         [not null, default: 0, note: 'CHECK >= 0']
+  owned          int         [not null, default: 0, note: 'CHECK >= 0']
+  limit_snapshot int         [not null, note: 'CHECK > 0; copies event.max_tickets_per_customer at first touch']
+  updated_at     timestamptz [not null, default: `now()`]
+
+  indexes {
+    (customer_id, event_id) [pk]
+  }
+  Note: 'Guard row for the per-customer limit. CHECK (held + owned <= limit_snapshot) — INV-4. Materialises a phantom/write-skew predicate into one row.'
+}
+
+Table sales.promo_code {
+  id               uuid      [pk]
+  event_id         uuid      [not null]
+  code             text      [not null]
+  discount_minor   bigint    [not null, note: 'CHECK > 0']
+  budget_minor     bigint    [not null, note: 'CHECK >= 0']
+  redeemed_minor   bigint    [not null, default: 0, note: 'CHECK >= 0; CHECK redeemed_minor <= budget_minor (INV-8)']
+  max_redemptions  int       [not null, note: 'CHECK > 0']
+  redemption_count int       [not null, default: 0, note: 'CHECK >= 0; CHECK redemption_count <= max_redemptions']
+  valid            tstzrange [not null]
+
+  indexes {
+    (`event_id`, `upper(code)`) [unique, name: 'promo_code_uk']
+  }
+}
+
+Table sales.promo_redemption {
+  id            uuid        [pk]
+  promo_code_id uuid        [not null]
+  customer_id   uuid        [not null]
+  cart_id       uuid        [not null]
+  amount_minor  bigint      [not null, note: 'CHECK > 0']
+  created_at    timestamptz [not null, default: `now()`]
+
+  indexes {
+    (promo_code_id, customer_id) [unique, name: 'promo_once_per_customer']
+    (promo_code_id, cart_id) [unique, name: 'promo_once_per_cart']
+  }
+}
+
+Table sales.ticket_order {
+  id              uuid        [pk]
+  cart_id         uuid        [not null]
+  customer_id     uuid        [not null]
+  event_id        uuid        [not null]
+  status          text        [not null, default: 'pending_payment', note: "CHECK IN ('pending_payment','paid','cancelled','expired','partially_refunded','refunded')"]
+  subtotal_minor  bigint      [not null, note: 'CHECK >= 0']
+  discount_minor  bigint      [not null, default: 0, note: 'CHECK >= 0']
+  total_minor     bigint      [not null, note: 'CHECK total_minor = subtotal_minor - discount_minor']
+  currency        "char(3)"   [not null]
+  idempotency_key text        [not null]
+  expires_at      timestamptz [not null]
+  version         int         [not null, default: 0]
+  created_at      timestamptz [not null, default: `now()`]
+  paid_at         timestamptz
+
+  indexes {
+    (idempotency_key) [unique, name: 'order_idempotency_uk', note: 'INV-10']
+    (cart_id) [unique, name: 'order_one_per_cart']
+    (expires_at) [name: 'ticket_order_pending_idx', note: "partial: WHERE status = 'pending_payment'"]
+  }
+}
+
+Table sales.ticket_order_line {
+  id               uuid   [pk]
+  order_id         uuid   [not null]
+  ticket_type_id   uuid   [not null]
+  seat_id          uuid   [note: 'CHECK (seat_id IS NULL OR quantity = 1)']
+  quantity         int    [not null, note: 'CHECK > 0']
+  unit_price_minor bigint [not null, note: 'CHECK >= 0']
+
+  indexes {
+    (order_id, ticket_type_id, seat_id) [unique, name: 'line_uk']
+  }
+}
+
+Table sales.ticket {
+  id                 uuid        [pk]
+  order_line_id      uuid        [not null]
+  seq                int         [not null, note: 'CHECK > 0']
+  event_id           uuid        [not null]
+  ticket_type_id     uuid        [not null]
+  seat_id            uuid
+  holder_customer_id uuid        [not null]
+  barcode            text        [not null]
+  status             text        [not null, default: 'issued', note: "CHECK IN ('issued','void','scanned')"]
+  issued_at          timestamptz [not null, default: `now()`]
+
+  indexes {
+    (order_line_id, seq) [unique, name: 'ticket_natural_uk', note: 'natural key that makes a retried transaction idempotent']
+    (barcode) [unique, name: 'ticket_barcode_uk']
+    (event_id, seat_id) [unique, name: 'ticket_one_live_per_seat_uk', note: "partial: WHERE seat_id IS NOT NULL AND status <> 'void' — INV-1"]
+  }
+}
+
+// ===========================================================================
+// schema: money
+// ===========================================================================
+
+Table money.account {
+  id       uuid      [pk]
+  kind     text      [not null, note: "CHECK IN ('customer_wallet','organizer_payable','platform_fee','psp_clearing','payout_clearing','promo_liability')"]
+  owner_id uuid      [note: 'customer/organizer id; NULL for platform accounts']
+  currency "char(3)" [not null]
+
+  indexes {
+    (kind, owner_id, currency) [unique, name: 'account_identity_uk']
+    (id, kind) [unique, name: 'account_kind_uk', note: 'lets account_balance carry a trusted copy of kind']
+  }
+}
+
+Table money.account_balance {
+  account_id    uuid        [pk]
+  account_kind  text        [not null]
+  balance_minor bigint      [not null, default: 0]
+  version       bigint      [not null, default: 0]
+  updated_at    timestamptz [not null, default: `now()`]
+  Note: 'Hot part of an otherwise immutable account. FK (account_id, account_kind) -> money.account (id, kind). CHECK (account_kind <> customer_wallet OR balance_minor >= 0) — INV-5.'
+}
+
+Table money.journal {
+  id             uuid        [pk]
+  kind           text        [not null, note: "CHECK IN ('topup','order_payment','refund','payout','fee','adjustment','transfer')"]
+  reference_type text        [not null]
+  reference_id   uuid        [not null]
+  currency       "char(3)"   [not null]
+  created_at     timestamptz [not null, default: `now()`]
+
+  indexes {
+    (kind, reference_type, reference_id) [unique, name: 'journal_reference_uk', note: 'makes ledger posting idempotent']
+  }
+}
+
+Table money.journal_entry {
+  id           bigint      [pk, note: 'GENERATED ALWAYS AS IDENTITY']
+  journal_id   uuid        [not null]
+  account_id   uuid        [not null]
+  amount_minor bigint      [not null, note: 'CHECK <> 0']
+  currency     "char(3)"   [not null]
+  created_at   timestamptz [not null, default: `now()`]
+
+  indexes {
+    (account_id, id) [name: 'journal_entry_account_idx']
+    (journal_id) [name: 'journal_entry_journal_idx']
+  }
+  Note: 'Append-only (rules block UPDATE/DELETE). CONSTRAINT TRIGGER journal_entry_balanced (DEFERRABLE INITIALLY DEFERRED): every journal sums to zero at COMMIT — INV-5 / INV-6.'
+}
+
+Table money.payment {
+  id              uuid        [pk]
+  order_id        uuid        [not null]
+  customer_id     uuid        [not null]
+  method          text        [not null, note: "CHECK IN ('wallet','card')"]
+  status          text        [not null, note: "CHECK IN ('initiated','authorizing','authorized','captured','failed','voided'); saga state machine"]
+  amount_minor    bigint      [not null, note: 'CHECK > 0']
+  captured_minor  bigint      [not null, default: 0, note: 'CHECK >= 0; CHECK captured_minor <= amount_minor']
+  refunded_minor  bigint      [not null, default: 0, note: 'CHECK >= 0; CHECK refunded_minor <= captured_minor (INV-7)']
+  currency        "char(3)"   [not null]
+  psp_reference   text
+  idempotency_key text        [not null]
+  version         int         [not null, default: 0]
+  created_at      timestamptz [not null, default: `now()`]
+  updated_at      timestamptz [not null, default: `now()`]
+
+  indexes {
+    (idempotency_key) [unique, name: 'payment_idempotency_uk', note: 'INV-10']
+    (updated_at) [name: 'payment_stranded_idx', note: "partial: WHERE status IN ('initiated','authorizing') — reconciler claim"]
+  }
+}
+
+Table money.payment_attempt {
+  id           uuid        [pk]
+  payment_id   uuid        [not null]
+  attempt_no   int         [not null, note: 'CHECK > 0']
+  outcome      text        [not null, note: "CHECK IN ('pending','success','declined','error','timeout')"]
+  psp_response jsonb
+  created_at   timestamptz [not null, default: `now()`]
+
+  indexes {
+    (payment_id, attempt_no) [unique, name: 'payment_attempt_uk']
+  }
+}
+
+Table money.refund {
+  id              uuid        [pk]
+  payment_id      uuid        [not null]
+  order_id        uuid        [not null]
+  amount_minor    bigint      [not null, note: 'CHECK > 0']
+  reason          text        [not null]
+  status          text        [not null, default: 'completed', note: "CHECK IN ('completed','failed')"]
+  idempotency_key text        [not null]
+  created_at      timestamptz [not null, default: `now()`]
+
+  indexes {
+    (idempotency_key) [unique, name: 'refund_idempotency_uk']
+  }
+}
+
+Table money.payout {
+  id            uuid        [pk]
+  organizer_id  uuid        [not null]
+  business_date date        [not null]
+  amount_minor  bigint      [not null, note: 'CHECK > 0']
+  status        text        [not null, default: 'pending', note: "CHECK IN ('pending','sent','failed')"]
+  created_at    timestamptz [not null, default: `now()`]
+
+  indexes {
+    (organizer_id, business_date) [unique, name: 'payout_once_per_day_uk', note: 'INV-11 / nightly rerun safety']
+  }
+}
+
+// ===========================================================================
+// schema: ops
+// ===========================================================================
+
+Table ops.outbox {
+  id              bigint      [pk, note: 'GENERATED ALWAYS AS IDENTITY']
+  aggregate_type  text        [not null]
+  aggregate_id    uuid        [not null]
+  event_type      text        [not null]
+  dedup_key       text        [not null]
+  payload         jsonb       [not null]
+  occurred_at     timestamptz [not null, default: `now()`]
+  published_at    timestamptz
+  attempts        int         [not null, default: 0]
+  next_attempt_at timestamptz [not null, default: `now()`]
+  last_error      text
+
+  indexes {
+    (dedup_key) [unique, name: 'outbox_dedup_uk']
+    (next_attempt_at, id) [name: 'outbox_pending_idx', note: 'partial: WHERE published_at IS NULL']
+  }
+}
+
+Table ops.processed_event {
+  consumer     text        [not null]
+  dedup_key    text        [not null]
+  processed_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (consumer, dedup_key) [pk]
+  }
+}
+
+Table ops.job {
+  id         bigint      [pk, note: 'GENERATED ALWAYS AS IDENTITY']
+  kind       text        [not null]
+  dedup_key  text        [not null]
+  state      text        [not null, default: 'ready', note: "CHECK IN ('ready','processing','done','failed')"]
+  run_after  timestamptz [not null, default: `now()`]
+  locked_by  text
+  locked_at  timestamptz
+  attempts   int         [not null, default: 0]
+  payload    jsonb       [not null]
+  last_error text
+
+  indexes {
+    (dedup_key) [unique, name: 'job_dedup_uk']
+    (run_after, id) [name: 'job_claimable_idx', note: "partial: WHERE state = 'ready'"]
+    (locked_at) [name: 'job_stuck_idx', note: "partial: WHERE state = 'processing'"]
+  }
+  Note: 'CHECK ((locked_by IS NULL) = (locked_at IS NULL)). Claimed with FOR UPDATE SKIP LOCKED.'
+}
+
+Table ops.idempotency_key {
+  key                 text        [pk]
+  endpoint            text        [not null]
+  actor_id            uuid        [not null]
+  request_fingerprint text        [not null]
+  state               text        [not null, note: "CHECK IN ('in_progress','completed')"]
+  response_status     int
+  response_body       jsonb
+  created_at          timestamptz [not null, default: `now()`]
+  expires_at          timestamptz [not null]
+
+  indexes {
+    (expires_at) [name: 'idempotency_expiry_idx']
+  }
+  Note: 'CHECK (state <> completed OR response_status IS NOT NULL). Client-facing replay protection with stored response.'
+}
+
+// ===========================================================================
+// references
+// ===========================================================================
+
+// catalog
+Ref: catalog.seat.venue_id > catalog.venue.id [delete: cascade]
+Ref: catalog.event.organizer_id > catalog.organizer.id
+Ref: catalog.event.venue_id > catalog.venue.id
+Ref: catalog.ticket_type.event_id > catalog.event.id [delete: cascade]
+Ref: catalog.event_seat.event_id > catalog.event.id [delete: cascade]
+Ref: catalog.event_seat.seat_id > catalog.seat.id
+Ref: catalog.event_seat.ticket_type_id > catalog.ticket_type.id
+Ref: catalog.payment_route.event_id > catalog.event.id [delete: cascade]
+
+// sales
+Ref: sales.ticket_type_inventory.ticket_type_id > catalog.ticket_type.id [delete: cascade]
+Ref: sales.cart.customer_id > catalog.customer.id
+Ref: sales.cart.event_id > catalog.event.id
+Ref: sales.hold.cart_id > sales.cart.id [delete: cascade]
+Ref: sales.hold.ticket_type_id > catalog.ticket_type.id
+Ref: sales.seat_hold.cart_id > sales.cart.id [delete: cascade]
+Ref: sales.seat_hold.(event_id, seat_id) > catalog.event_seat.(event_id, seat_id)
+Ref: sales.customer_event_allocation.customer_id > catalog.customer.id
+Ref: sales.customer_event_allocation.event_id > catalog.event.id
+Ref: sales.promo_code.event_id > catalog.event.id [delete: cascade]
+Ref: sales.promo_redemption.promo_code_id > sales.promo_code.id
+Ref: sales.promo_redemption.customer_id > catalog.customer.id
+Ref: sales.promo_redemption.cart_id > sales.cart.id [delete: cascade]
+Ref: sales.ticket_order.cart_id > sales.cart.id
+Ref: sales.ticket_order.customer_id > catalog.customer.id
+Ref: sales.ticket_order.event_id > catalog.event.id
+Ref: sales.ticket_order_line.order_id > sales.ticket_order.id [delete: cascade]
+Ref: sales.ticket_order_line.ticket_type_id > catalog.ticket_type.id
+Ref: sales.ticket.order_line_id > sales.ticket_order_line.id
+Ref: sales.ticket.event_id > catalog.event.id
+Ref: sales.ticket.ticket_type_id > catalog.ticket_type.id
+Ref: sales.ticket.holder_customer_id > catalog.customer.id
+
+// money
+Ref: money.account_balance.(account_id, account_kind) > money.account.(id, kind)
+Ref: money.journal_entry.journal_id > money.journal.id
+Ref: money.journal_entry.account_id > money.account.id
+Ref: money.payment.order_id > sales.ticket_order.id
+Ref: money.payment.customer_id > catalog.customer.id
+Ref: money.payment_attempt.payment_id > money.payment.id
+Ref: money.refund.payment_id > money.payment.id
+Ref: money.refund.order_id > sales.ticket_order.id
+Ref: money.payout.organizer_id > catalog.organizer.id
+
+// ===========================================================================
+// table groups
+// ===========================================================================
+
+TableGroup catalog {
+  catalog.organizer
+  catalog.customer
+  catalog.venue
+  catalog.seat
+  catalog.event
+  catalog.ticket_type
+  catalog.event_seat
+  catalog.payment_route
+}
+
+TableGroup sales {
+  sales.ticket_type_inventory
+  sales.cart
+  sales.hold
+  sales.seat_hold
+  sales.customer_event_allocation
+  sales.promo_code
+  sales.promo_redemption
+  sales.ticket_order
+  sales.ticket_order_line
+  sales.ticket
+}
+
+TableGroup money {
+  money.account
+  money.account_balance
+  money.journal
+  money.journal_entry
+  money.payment
+  money.payment_attempt
+  money.refund
+  money.payout
+}
+
+TableGroup ops {
+  ops.outbox
+  ops.processed_event
+  ops.job
+  ops.idempotency_key
+}

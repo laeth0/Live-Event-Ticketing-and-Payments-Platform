@@ -265,3 +265,9 @@ services.Scan(scan => scan
   validation, authorization, status codes, `ProblemDetails`, and cancellation behavior.
 - When EF Core behavior changes, inspect generated SQL where relevant and confirm that
   the migration, model snapshot, and database update contain only the intended changes.
+
+<!-- openwolf:begin -->
+# OpenWolf
+
+This project uses OpenWolf for context management. Read and follow .wolf/OPENWOLF.md at session start. Check .wolf/cerebrum.md before generating code. Grep .wolf/anatomy.md for a file's path before reading it (never read the whole index).
+<!-- openwolf:end -->
