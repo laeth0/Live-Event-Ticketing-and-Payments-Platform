@@ -44,7 +44,7 @@ Extensions (`btree_gist`), schemas, roles and role-level settings, connection po
    with `statement_timeout`, `idle_in_transaction_session_timeout`, `lock_timeout` set at role
    level.
 4. `make lab` / `pwsh ./lab.ps1`: opens two `psql` shells with the `A>` / `B>` prompts and `%x`
-   transaction indicators from `roadmap/00-start-here.md §3.2`.
+   transaction indicators from `../roadmap/00-start-here.md §3.2`.
 5. `POST /ops/reset` (Development only) that truncates and re-seeds deterministically.
 
 ### Tests required

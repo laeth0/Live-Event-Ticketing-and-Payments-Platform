@@ -6,7 +6,7 @@
 
 | Layer | Choice | Version | Note |
 |---|---|---|---|
-| Runtime | .NET | **8 (LTS)** | Matches `roadmap/00-start-here.md §3.4`. On .NET 9+ use `Guid.CreateVersion7()` for UUIDv7 keys; on 8, use a small local generator. |
+| Runtime | .NET | **8 (LTS)** | Matches `../roadmap/00-start-here.md §3.4`. On .NET 9+ use `Guid.CreateVersion7()` for UUIDv7 keys; on 8, use a small local generator. |
 | API | ASP.NET Core Minimal APIs | 8 | Endpoint-per-file; no MVC controllers needed |
 | Database | PostgreSQL | **16** | `btree_gist`, `pg_stat_statements` |
 | Driver | **Npgsql** | 8.x | `NpgsqlDataSource` is the app-wide factory |

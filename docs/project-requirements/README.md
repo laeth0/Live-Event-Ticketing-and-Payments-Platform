@@ -17,7 +17,7 @@ whether you got it right.
 
 | File | Section | What it contains |
 |---|---|---|
-| `00-README.md` | — | This index, conventions, how to use the document |
+| `README.md` | — | This index, conventions, how to use the document |
 | `01-project-overview.md` | §1 | Domain, why ticketing, real-world scenario, the seven invariants |
 | `02-functional-requirements.md` | §2 | 18 features, each with workflow, DB ops, transaction requirements, anomalies, concepts |
 | `03-non-functional-requirements.md` | §3 | Performance, consistency, reliability, operational limits |
